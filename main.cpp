@@ -1,18 +1,18 @@
-// ADS1263 on RX72N – example using SCI6 in simple-SPI mode
+// ADS1263 on RX72N – example using SCI1 in simple-SPI mode
 //
 // Pin assignment
 // ─────────────────────────────────────────────────────────────
 //  RX72N pin  │ ADS1263 pin │ Function
 // ────────────┼─────────────┼─────────────────────────────────
-//  P26        │ DOUT        │ SMISO6  (SCI6 MISO)  [FIT-managed]
-//  P27        │ DIN         │ SMOSI6  (SCI6 MOSI)  [FIT-managed]
-//  P30        │ SCLK        │ SCK6    (SCI6 clock)  [FIT-managed]
+//  P26        │ DOUT        │ SMISO1  (SCI1 MISO)  [FIT-managed]
+//  P27        │ DIN         │ SMOSI1  (SCI1 MOSI)  [FIT-managed]
+//  P30        │ SCLK        │ SCK1    (SCI1 clock)  [FIT-managed]
 //  P31        │ /CS         │ GPIO output, active-low [manual]
 // ─────────────────────────────────────────────────────────────
 //
 // NOTE: The SCI FIT module configures the MPC registers for P26/P27/P30
 //       via the auto-generated r_sci_rx_pinset.c (Smart Configurator).
-//       Verify that the pinset file targets SCI channel 6 and those exact
+//       Verify that the pinset file targets SCI channel 1 and those exact
 //       pins for your RX72N package / board variant.
 //
 // SPI parameters
@@ -51,7 +51,7 @@ static void setup_cs_pin(void)
 
 // Open SCI6 as a SPI master.
 // Returns the channel handle; halts on configuration error.
-static sci_hdl_t open_sci6_spi(void)
+static sci_hdl_t open_sci1_spi(void)
 {
     sci_cfg_t cfg;
     cfg.sync.spi_mode    = SCI_SPI_MODE_1;   // CPOL=0, CPHA=1
@@ -60,7 +60,7 @@ static sci_hdl_t open_sci6_spi(void)
     cfg.sync.invert_data = false;
 
     sci_hdl_t hdl;
-    const sci_err_t err = R_SCI_Open(SCI_CH6,
+    const sci_err_t err = R_SCI_Open(SCI_CH1,
                                       SCI_MODE_SYNC,
                                       &cfg,
                                       ads1263_sci_callback,
@@ -83,7 +83,7 @@ void main(void)
 
     setup_cs_pin();
 
-    sci_hdl_t sci_hdl = open_sci6_spi();
+    sci_hdl_t sci_hdl = open_sci1_spi();
 
     // Create driver; PORT3.PODR.BYTE is the output data register for Port 3,
     // 0x02 selects bit 1 (P31).
