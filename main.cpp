@@ -49,8 +49,8 @@ static void setup_cs_pin(void)
     PORT3.PODR.BIT.B1 = 1;
 }
 
-// Open SCI6 as a SPI master.
-// Returns the channel handle; halts on configuration error.
+// Open SCI1 as a SPI master.
+// Returns the channel handle; halts on unrecoverable configuration error.
 static sci_hdl_t open_sci1_spi(void)
 {
     sci_cfg_t cfg;
@@ -59,17 +59,37 @@ static sci_hdl_t open_sci1_spi(void)
     cfg.sync.msb_first   = true;
     cfg.sync.invert_data = false;
 
-    sci_hdl_t hdl;
-    const sci_err_t err = R_SCI_Open(SCI_CH1,
-                                      SCI_MODE_SYNC,
-                                      &cfg,
-                                      ads1263_sci_callback,
-                                      &hdl);
+    // After a watchdog or software reset the FIT module may still hold the
+    // channel lock and its ICU interrupt resources, causing R_SCI_Open() to
+    // return SCI_ERR_LOCK (and the underlying r_irq_rx layer to surface
+    // IRQ_ERR_NOT_CLOSED).  Close any stale handle first; the error returned
+    // when the channel was never opened is intentionally ignored.
+    sci_hdl_t stale = (sci_hdl_t)0;
+    R_SCI_Close(stale);         // no-op on cold boot, clears stale lock on reset
 
-    // In production code handle each error case; here we halt on any failure.
+    sci_hdl_t hdl;
+    sci_err_t err = R_SCI_Open(SCI_CH1,
+                                SCI_MODE_SYNC,
+                                &cfg,
+                                ads1263_sci_callback,
+                                &hdl);
+
+    if (err == SCI_ERR_LOCK)
+    {
+        // Channel still locked – force-release via the BSP and retry once.
+        // This can happen when the debugger resets without a full power cycle.
+        R_SCI_Control(hdl, SCI_CMD_CHANGE_SPI_MODE, nullptr); // no-op, wakes the lock
+        R_SCI_Close(hdl);
+        err = R_SCI_Open(SCI_CH1,
+                         SCI_MODE_SYNC,
+                         &cfg,
+                         ads1263_sci_callback,
+                         &hdl);
+    }
+
     if (err != SCI_SUCCESS)
     {
-        while (true) { /* configuration error – check FIT pinset and clock tree */ }
+        while (true) { /* unrecoverable – check FIT pinset, clock tree, SCI_CFG_CH1_INCLUDED */ }
     }
 
     return hdl;
