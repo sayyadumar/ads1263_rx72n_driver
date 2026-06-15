@@ -242,48 +242,70 @@ bool ADS1263::stop()
     return sendCmd(ADS1263Cmd::STOP1);
 }
 
+// ─── DRDY flag (optional IRQ path) ───────────────────────────────────────────
+
+void ADS1263::setDRDYFlag(volatile bool* flag)
+{
+    m_drdy_flag = flag;
+}
+
 // ─── Data read ────────────────────────────────────────────────────────────────
 
 bool ADS1263::read(int32_t& raw, uint32_t timeout_ms)
 {
-    // With IFACE.STATUS = 1, RDATA1 returns 5 bytes:
-    //   Byte 0: STATUS  (bit 6 = ADC1 data ready since last RDATA1)
-    //   Byte 1: DATA[31:24]  MSB
-    //   Byte 2: DATA[23:16]
-    //   Byte 3: DATA[15:8]
-    //   Byte 4: DATA[7:0]   LSB
-
-    // TX: [RDATA1] [0x00 x4] – the trailing zeros clock out the response
+    // RDATA1 frame: [cmd][dummy x4]  →  response: [STATUS][D3][D2][D1][D0]
     const uint8_t tx[5] = {
         static_cast<uint8_t>(ADS1263Cmd::RDATA1),
         0x00U, 0x00U, 0x00U, 0x00U
     };
     uint8_t rx[5] = {};
 
-    const uint32_t deadline_ms = timeout_ms;
-    uint32_t elapsed_ms = 0U;
+    auto assemble = [&]() -> int32_t {
+        const uint32_t u =
+            (static_cast<uint32_t>(rx[1]) << 24U) |
+            (static_cast<uint32_t>(rx[2]) << 16U) |
+            (static_cast<uint32_t>(rx[3]) <<  8U) |
+             static_cast<uint32_t>(rx[4]);
+        return static_cast<int32_t>(u);
+    };
 
-    while (elapsed_ms <= deadline_ms)
+    if (m_drdy_flag != nullptr)
+    {
+        // ── IRQ path: wait for the ISR flag, then issue one RDATA1 ──────────
+        // Clear any stale assertion before waiting so we don't read old data.
+        *m_drdy_flag = false;
+
+        uint32_t elapsed = 0U;
+        while (!(*m_drdy_flag) && elapsed <= timeout_ms)
+        {
+            delayMs(1U);
+            ++elapsed;
+        }
+        if (elapsed > timeout_ms) { return false; }
+
+        csLow();
+        const bool ok = spiTransfer(tx, rx, 5U);
+        csHigh();
+        if (!ok) { return false; }
+
+        raw = assemble();
+        return true;
+    }
+
+    // ── Polling path: loop RDATA1 until STATUS.ADC1 is set ──────────────────
+    // With IFACE.STATUS=1, bit 6 of rx[0] indicates new data since last read.
+    uint32_t elapsed_ms = 0U;
+    while (elapsed_ms <= timeout_ms)
     {
         csLow();
         const bool ok = spiTransfer(tx, rx, 5U);
         csHigh();
 
-        if (!ok)
-        {
-            return false;
-        }
+        if (!ok) { return false; }
 
         if ((rx[0] & STATUS_ADC1_RDY) != 0U)
         {
-            // Assemble big-endian 32-bit two's-complement value
-            const uint32_t u =
-                (static_cast<uint32_t>(rx[1]) << 24U) |
-                (static_cast<uint32_t>(rx[2]) << 16U) |
-                (static_cast<uint32_t>(rx[3]) <<  8U) |
-                 static_cast<uint32_t>(rx[4]);
-
-            raw = static_cast<int32_t>(u);
+            raw = assemble();
             return true;
         }
 

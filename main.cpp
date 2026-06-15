@@ -1,71 +1,133 @@
 // ADS1263 on RX72N – example using SCI1 in simple-SPI mode
 //
 // Pin assignment
-// ─────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────
 //  RX72N pin  │ ADS1263 pin │ Function
-// ────────────┼─────────────┼─────────────────────────────────
-//  P26        │ DOUT        │ SMISO1  (SCI1 MISO)  [FIT-managed]
-//  P27        │ DIN         │ SMOSI1  (SCI1 MOSI)  [FIT-managed]
-//  P30        │ SCLK        │ SCK1    (SCI1 clock)  [FIT-managed]
-//  P31        │ /CS         │ GPIO output, active-low [manual]
-// ─────────────────────────────────────────────────────────────
+// ────────────┼─────────────┼────────────────────────────────────────
+//  P26        │ DOUT        │ SMISO1  (SCI1 MISO)       [FIT-managed]
+//  P27        │ DIN         │ SMOSI1  (SCI1 MOSI)       [FIT-managed]
+//  P30        │ SCLK        │ SCK1    (SCI1 clock)      [FIT-managed]
+//  P31        │ /CS         │ GPIO output, active-low   [manual]
+//  <IRQ12 pin>│ /DRDY       │ IRQ12 input, active-low   [manual + r_irq_rx]
+// ──────────────────────────────────────────────────────────────────
 //
-// NOTE: The SCI FIT module configures the MPC registers for P26/P27/P30
-//       via the auto-generated r_sci_rx_pinset.c (Smart Configurator).
-//       Verify that the pinset file targets SCI channel 1 and those exact
-//       pins for your RX72N package / board variant.
+// IRQ12 pin: check your RX72N hardware manual section 21 (ICU interrupt
+//   source table) for which physical pin carries IRQ12 on your package.
+//   Common assignments are P04 (100-pin) or PE4 (176-pin).  The ISEL
+//   bit in that pin's PFS register enables the IRQ input function.
+//
+// r_irq_rx_config.h prerequisite:
+//   #define IRQ_CFG_CH12_INCLUDED   (1)
 //
 // SPI parameters
-//   Mode    : 1  (CPOL=0, CPHA=1 – ADS1263 samples DIN on falling SCLK edge)
-//   Bit rate: 1 MHz  (ADS1263 max is 10 MHz; start conservatively)
+//   Mode    : 1  (CPOL=0, CPHA=1 – ADS1263 samples DIN on falling SCLK)
+//   Bit rate: 1 MHz  (ADS1263 max 10 MHz; conservative start value)
 //   Bit order: MSB first
-//
-// Reference voltage: internal 2.5 V (VREF pin left open or tied to AVSS)
-// Input measured   : AIN0(+) vs AIN1(-)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "platform.h"           // Renesas BSP – pulls in iodefine.h and r_bsp.h
 #include "r_sci_rx_if.h"
+#include "r_irq_rx_if.h"
 #include "r_bsp_common.h"
 
 #include "ads1263.hpp"
 
-// ─── SCI callback (defined in ads1263.cpp, declared here) ─────────────────────
+// ─── SCI callback (defined in ads1263.cpp) ────────────────────────────────────
 extern "C" void ads1263_sci_callback(void* p_args);
 
-// ─── Setup helpers ────────────────────────────────────────────────────────────
+// ─── IRQ12 (ADS1263 /DRDY) ───────────────────────────────────────────────────
 
-// Configure P31 as a push-pull output (CS line).
-// P26/P27/P30 are left to R_SCI_Open() / the FIT pinset function.
-static void setup_cs_pin(void)
+static irq_hdl_t     s_irq12_hdl;
+static volatile bool s_drdy = false;   // set by ISR, cleared by read()
+
+static void irq12_callback(void* /*p_args*/)
 {
-    // 1. Disable analog input on P31 (clear ASEL bit in MPC if needed)
-    //    For a pure digital port pin no MPC change is required.
-
-    // 2. Set direction: output
-    PORT3.PDR.BIT.B1 = 1;
-
-    // 3. Drive high (CS deasserted) before the driver object is created
-    PORT3.PODR.BIT.B1 = 1;
+    s_drdy = true;
 }
 
-// Open SCI1 as a SPI master.
-// Returns the channel handle; halts on unrecoverable configuration error.
+// Configure and open IRQ12 for the ADS1263 /DRDY signal.
+//
+// Three things must be correct or you get IRQ_ERR_NOT_CLOSED:
+//   1. r_irq_rx_config.h  → IRQ_CFG_CH12_INCLUDED = 1
+//   2. MPC ISEL bit       → enable IRQ input on the chosen pin
+//   3. Close before open  → clear stale handle after warm reset
+//
+// ── Step 1: verify r_irq_rx_config.h ─────────────────────────────────────────
+//   Open r_irq_rx_config.h in your FIT module and confirm:
+//     #define IRQ_CFG_CH12_INCLUDED   (1)
+//   Without this, the channel is compiled out and R_IRQ_Open(12,...) returns
+//   IRQ_ERR_BAD_CHAN, which the FIT plumbing can surface as IRQ_ERR_NOT_CLOSED
+//   from a previous call that left the channel in a bad state.
+//
+// ── Step 2: MPC pin configuration ────────────────────────────────────────────
+//   Find the pin that carries IRQ12 in your RX72N package pin function table
+//   (hardware manual, section "Port Function Select").  Set ISEL = 1 in its
+//   PxxPFS register; PSEL stays 0 (IRQ is not a peripheral function, it is an
+//   ICU function enabled via the ISEL bit only).
+//
+// ── Step 3: close-before-open ────────────────────────────────────────────────
+//   After a watchdog / debugger reset, r_irq_rx keeps its channel-open flag
+//   set in RAM.  R_IRQ_Open() then sees the channel as still open and returns
+//   IRQ_ERR_NOT_CLOSED.  The fix is to call R_IRQ_Close() first; it is a
+//   harmless no-op on the very first cold boot.
+
+static void irq12_init(void)
+{
+    // ── MPC: enable IRQ12 on the chosen pin ──────────────────────────────────
+    // EXAMPLE uses P04 (100-pin package).  Replace with your actual pin.
+    // Only the ISEL bit is touched; PSEL remains 0.
+    MPC.PWPR.BIT.B0WI  = 0;     // unlock step 1
+    MPC.PWPR.BIT.PFSWE = 1;     // unlock step 2
+    MPC.P04PFS.BIT.ISEL = 1;    // enable IRQ12 input on P04  ← verify your pin
+    MPC.PWPR.BIT.PFSWE = 0;     // lock step 2
+    MPC.PWPR.BIT.B0WI  = 1;     // lock step 1
+
+    // ── GPIO direction: input ─────────────────────────────────────────────────
+    PORT0.PDR.BIT.B4 = 0;       // input  ← match port/bit to your IRQ12 pin
+
+    // ── Close any stale handle (prevents IRQ_ERR_NOT_CLOSED after warm reset) ─
+    R_IRQ_Close(s_irq12_hdl);   // safe even if channel was never opened
+
+    // ── Configure and open ────────────────────────────────────────────────────
+    irq_cfg_t cfg;
+    cfg.trigger    = IRQ_TRIG_FALLING;        // /DRDY asserts low on conversion done
+    cfg.filter     = IRQ_FILTER_PCLKB_DIV_8;  // light digital glitch filter
+    cfg.priority   = 3;                        // must be ≥ SCI1 TXI/RXI priority
+    cfg.p_callback = irq12_callback;
+
+    const irq_err_t err = R_IRQ_Open(12U, &cfg, &s_irq12_hdl);
+    if (err != IRQ_SUCCESS)
+    {
+        // Possible causes:
+        //   IRQ_ERR_NOT_CLOSED – channel still locked; ensure R_IRQ_Close() above ran
+        //   IRQ_ERR_BAD_CHAN   – IRQ_CFG_CH12_INCLUDED is 0 in r_irq_rx_config.h
+        while (true) {}
+    }
+
+    R_IRQ_Enable(s_irq12_hdl);
+}
+
+// ─── CS pin setup ─────────────────────────────────────────────────────────────
+
+static void setup_cs_pin(void)
+{
+    PORT3.PDR.BIT.B1  = 1;     // P31 output
+    PORT3.PODR.BIT.B1 = 1;     // CS deasserted (high)
+}
+
+// ─── SCI1 SPI open ────────────────────────────────────────────────────────────
+
 static sci_hdl_t open_sci1_spi(void)
 {
     sci_cfg_t cfg;
-    cfg.sync.spi_mode    = SCI_SPI_MODE_1;   // CPOL=0, CPHA=1
-    cfg.sync.bit_rate    = 1000000UL;         // 1 MHz
+    cfg.sync.spi_mode    = SCI_SPI_MODE_1;
+    cfg.sync.bit_rate    = 1000000UL;
     cfg.sync.msb_first   = true;
     cfg.sync.invert_data = false;
 
-    // After a watchdog or software reset the FIT module may still hold the
-    // channel lock and its ICU interrupt resources, causing R_SCI_Open() to
-    // return SCI_ERR_LOCK (and the underlying r_irq_rx layer to surface
-    // IRQ_ERR_NOT_CLOSED).  Close any stale handle first; the error returned
-    // when the channel was never opened is intentionally ignored.
+    // Close-before-open: same warm-reset defence as IRQ12 above
     sci_hdl_t stale = (sci_hdl_t)0;
-    R_SCI_Close(stale);         // no-op on cold boot, clears stale lock on reset
+    R_SCI_Close(stale);
 
     sci_hdl_t hdl;
     sci_err_t err = R_SCI_Open(SCI_CH1,
@@ -76,20 +138,13 @@ static sci_hdl_t open_sci1_spi(void)
 
     if (err == SCI_ERR_LOCK)
     {
-        // Channel still locked – force-release via the BSP and retry once.
-        // This can happen when the debugger resets without a full power cycle.
-        R_SCI_Control(hdl, SCI_CMD_CHANGE_SPI_MODE, nullptr); // no-op, wakes the lock
         R_SCI_Close(hdl);
-        err = R_SCI_Open(SCI_CH1,
-                         SCI_MODE_SYNC,
-                         &cfg,
-                         ads1263_sci_callback,
-                         &hdl);
+        err = R_SCI_Open(SCI_CH1, SCI_MODE_SYNC, &cfg, ads1263_sci_callback, &hdl);
     }
 
     if (err != SCI_SUCCESS)
     {
-        while (true) { /* unrecoverable – check FIT pinset, clock tree, SCI_CFG_CH1_INCLUDED */ }
+        while (true) { /* check SCI_CFG_CH1_INCLUDED and FIT pinset */ }
     }
 
     return hdl;
@@ -99,71 +154,48 @@ static sci_hdl_t open_sci1_spi(void)
 
 void main(void)
 {
-    // --- Hardware initialisation -------------------------------------------
-
     setup_cs_pin();
+    irq12_init();
 
     sci_hdl_t sci_hdl = open_sci1_spi();
 
-    // Create driver; PORT3.PODR.BYTE is the output data register for Port 3,
-    // 0x02 selects bit 1 (P31).
+    // PORT3.PODR.BYTE = output data register for Port 3; 0x02 = bit 1 (P31)
     ADS1263 adc(sci_hdl, PORT3.PODR.BYTE, 0x02U);
-
-    // --- ADS1263 initialisation --------------------------------------------
-    //   • 100 SPS data rate
-    //   • PGA bypassed (gain = 1×)
-    //   • Differential: AIN0(+) vs AIN1(-)
-    //   • Internal 2.5 V reference (default after reset)
 
     if (!adc.begin(ADS1263Rate::SPS_100, ADS1263Gain::GAIN_1))
     {
-        // ID verification failed – check wiring and SPI timing
-        while (true) {}
+        while (true) {}     // ID check failed – verify SPI wiring and timing
     }
 
-    // Start continuous conversions on ADC1
-    adc.start();
+    // Hand the DRDY flag to the driver so read() uses the IRQ path
+    adc.setDRDYFlag(&s_drdy);
 
-    // --- Main measurement loop ---------------------------------------------
+    adc.start();
 
     while (true)
     {
         int32_t raw = 0;
 
-        if (adc.read(raw, 500U))     // 500 ms timeout
+        if (adc.read(raw, 500U))
         {
             const float voltage = ADS1263::toVolts(raw, 2.5f, ADS1263Gain::GAIN_1);
-
-            // Replace with your application's output (UART printf, display, etc.)
             (void)voltage;
             (void)raw;
-
-            // Example: send over SCI UART
-            //   char buf[64];
-            //   snprintf(buf, sizeof(buf), "raw=%ld  V=%.6f\r\n", raw, (double)voltage);
-            //   R_SCI_Send(uart_hdl, (uint8_t*)buf, strlen(buf));
+            // e.g. R_SCI_Send(uart_hdl, buf, len);
         }
-        else
-        {
-            // Timeout – ADC not converting or wiring issue
-        }
-
-        // Delay between reads (optional; remove for maximum throughput)
-        R_BSP_SoftwareDelay(10U, BSP_DELAY_MILLISECS);  // ~10 ms between samples
     }
 }
 
-// ─── Advanced usage examples (not compiled) ──────────────────────────────────
+// ─── Advanced usage (not compiled) ───────────────────────────────────────────
 //
-// Single-ended measurement vs AINCOM (AIN2 as input):
+// Revert to STATUS-byte polling (no DRDY pin wired):
+//   adc.setDRDYFlag(nullptr);
+//
+// Single-ended vs AINCOM:
 //   adc.setMux(ADS1263Mux::AIN2, ADS1263Mux::AINCOM);
 //
-// Differential AIN4(+) vs AIN5(-) at 32× gain, 20 SPS:
+// 32× gain differential:
 //   adc.setMux(ADS1263Mux::AIN4, ADS1263Mux::AIN5);
 //   adc.setGain(ADS1263Gain::GAIN_32);
 //   adc.setRate(ADS1263Rate::SPS_20);
 //   float v = ADS1263::toVolts(raw, 2.5f, ADS1263Gain::GAIN_32);
-//
-// Direct register write (e.g. configure TDACP excitation current):
-//   adc.writeReg(ADS1263Reg::IDACMAG, 0x07);  // 1 mA IDAC
-//   adc.writeReg(ADS1263Reg::IDACMUX, 0x00);  // route IDAC1 to AIN0

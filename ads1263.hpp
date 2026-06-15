@@ -149,7 +149,14 @@ public:
     bool start();
     bool stop();
 
-    // Read one ADC1 result. Polls the STATUS byte DRDY flag.
+    // Register a volatile flag that an external IRQ ISR sets when DRDY asserts.
+    // When set, read() waits on this flag instead of polling the STATUS byte —
+    // more CPU-efficient and lower latency.  Pass nullptr to revert to polling.
+    void setDRDYFlag(volatile bool* flag);
+
+    // Read one ADC1 result.
+    // If a DRDY flag was registered via setDRDYFlag(), waits on that flag.
+    // Otherwise polls the STATUS byte returned by the RDATA1 command.
     // raw: signed 32-bit two's-complement result
     // Returns false on timeout or SPI error.
     bool read(int32_t& raw, uint32_t timeout_ms = 500);
@@ -168,6 +175,7 @@ private:
     sci_hdl_t         m_hdl;
     volatile uint8_t& m_cs_podr;
     uint8_t           m_cs_mask;
+    volatile bool*    m_drdy_flag = nullptr;   // set by IRQ ISR; nullptr = poll STATUS
 
     void csLow();
     void csHigh();
