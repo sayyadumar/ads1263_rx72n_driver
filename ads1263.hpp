@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+extern "C" {
 #include "r_sci_rx_if.h"
+}
 
 // ─── ADS1263 register map ────────────────────────────────────────────────────
 
@@ -107,12 +109,12 @@ enum class ADS1263Gain : uint8_t
     GAIN_32 = 0x5,
 };
 
-// ─── IFACE register bits (0x02) ───────────────────────────────────────────────
-// Bit 4: TIMEOUT   – SPI timeout enable
-// Bit 3: STATUS    – Prepend STATUS byte to RDATA1/2 response
-// Bit 2: CRC[1]  ─┐ 00 = off, 01 = checksum, 10 = CRC-16
-// Bit 1: CRC[0]  ─┘
-static constexpr uint8_t IFACE_STATUS_BIT = (1U << 3);
+// ─── INTERFACE register bits (0x02) ───────────────────────────────────────────
+// Per datasheet Table 9-37:
+//   Bit 3:   TIMEOUT  – serial interface auto-timeout enable
+//   Bit 2:   STATUS   – prepend STATUS byte to RDATA1/2 response
+//   Bit 1:0: CRC[1:0] – 00 = off, 01 = checksum, 10 = CRC
+static constexpr uint8_t IFACE_STATUS_BIT = (1U << 2);   // 0x04 (was wrongly 0x08)
 
 // STATUS byte bit 6: set when ADC1 has new data since last RDATA1
 static constexpr uint8_t STATUS_ADC1_RDY  = (1U << 6);
@@ -129,6 +131,18 @@ public:
     // Example (P31 = PORT3 bit 1):
     //   ADS1263 adc(hdl, PORT3.PODR.BYTE, 0x02);
     ADS1263(sci_hdl_t hdl, volatile uint8_t& cs_podr, uint8_t cs_mask);
+
+    // Register a hardware RESET/PWDN pin (active-low GPIO output).
+    // When set, begin()/reset() pulse this pin instead of sending the software
+    // RESET command.  The caller must configure the pin as an output and drive
+    // it high (deasserted) before use.
+    //   podr – pointer to the pin's port output data register byte
+    //   mask – bit mask of the pin within that byte (e.g. 0x04 for bit 2)
+    void setResetPin(volatile uint8_t* podr, uint8_t mask);
+
+    // Reset the ADC.  Uses the hardware RESET/PWDN pin if one was registered
+    // via setResetPin(); otherwise issues the software RESET command.
+    void reset();
 
     // Reset device and apply initial configuration.
     // Enables STATUS byte in RDATA1 response for DRDY polling.
@@ -171,11 +185,17 @@ public:
     bool    writeReg(ADS1263Reg reg, uint8_t val);
     uint8_t readReg(ADS1263Reg reg);
 
+    // STATUS byte from the most recent read() attempt (for diagnostics).
+    uint8_t lastStatus() const { return m_last_status; }
+
 private:
     sci_hdl_t         m_hdl;
     volatile uint8_t& m_cs_podr;
     uint8_t           m_cs_mask;
     volatile bool*    m_drdy_flag = nullptr;   // set by IRQ ISR; nullptr = poll STATUS
+    volatile uint8_t* m_rst_podr  = nullptr;   // HW RESET/PWDN pin; nullptr = SW reset cmd
+    uint8_t           m_rst_mask  = 0;
+    uint8_t           m_last_status = 0;       // STATUS byte from last read() (diagnostics)
 
     void csLow();
     void csHigh();

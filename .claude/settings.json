@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rx-elf-gcc --version)",
+      "Bash(rx-elf-gcc --target-help)",
+      "Bash(cmake -B build -DCMAKE_TOOLCHAIN_FILE=rx72n-toolchain.cmake)",
+      "Bash(rx-elf-gcc -mcpu=rx72T -misa=v3 -x c -c /dev/null -o /dev/null)",
+      "Bash(rx-elf-gcc -mcpu=rx72t -misa=v3 -x c -c /dev/null -o /dev/null)",
+      "Bash(rx-elf-gcc -mcpu=rx71m -x c -c /dev/null -o /dev/null)",
+      "Bash(rx-elf-gcc -mlittle-endian-data -x c -c /dev/null -o /dev/null)",
+      "Bash(cmake --build build)",
+      "Bash(JLinkExe -?)",
+      "Bash(JLinkExe)",
+      "Read(//opt/SEGGER/JLink_V810/Samples/JFlash/**)",
+      "Read(//opt/SEGGER/JLink_V810/ETC/JFlash/**)"
+    ]
+  }
+}

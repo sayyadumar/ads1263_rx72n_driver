@@ -1,5 +1,7 @@
 #include "ads1263.hpp"
+extern "C" {
 #include "r_bsp_common.h"   // R_BSP_SoftwareDelay
+}
 
 // ─── SCI callback shim ────────────────────────────────────────────────────────
 // Registered at R_SCI_Open() time.  Set s_tx_done once the SCI synchronous
@@ -10,7 +12,7 @@ static volatile bool s_tx_done = false;
 extern "C" void ads1263_sci_callback(void* p_args)
 {
     const sci_cb_args_t* p = static_cast<const sci_cb_args_t*>(p_args);
-    if (p->event == SCI_EVT_TX_DONE)
+    if (p->event == SCI_EVT_XFER_DONE)
     {
         s_tx_done = true;
     }
@@ -140,17 +142,40 @@ uint8_t ADS1263::readReg(ADS1263Reg reg)
     return ok ? rx[2] : 0xFFU;
 }
 
+// ─── Reset control ────────────────────────────────────────────────────────────
+
+void ADS1263::setResetPin(volatile uint8_t* podr, uint8_t mask)
+{
+    m_rst_podr = podr;
+    m_rst_mask = mask;
+}
+
+void ADS1263::reset()
+{
+    if (m_rst_podr != nullptr)
+    {
+        // Hardware reset via RESET/PWDN pin (active-low).
+        // Datasheet th(RSTL): low >= 4 tCLK (~0.5 µs) resets; must stay < 65536
+        // tCLK (~9 ms) or the device enters power-down.  10 µs is safely between.
+        *m_rst_podr &= static_cast<uint8_t>(~m_rst_mask);   // assert (low)
+        delayUs(10U);
+        *m_rst_podr |= m_rst_mask;                           // deassert (high)
+    }
+    else
+    {
+        // Software reset command (RESET opcode 0x06).
+        sendCmd(ADS1263Cmd::RESET);
+    }
+}
+
 // ─── Initialisation ───────────────────────────────────────────────────────────
 
 bool ADS1263::begin(ADS1263Rate rate, ADS1263Gain gain)
 {
-    delayMs(10U);   // allow internal power-on reset to complete
+    delayMs(50U);   // POR: datasheet recommends >=50 ms after supplies stabilise
 
-    if (!sendCmd(ADS1263Cmd::RESET))
-    {
-        return false;
-    }
-    delayMs(2U);    // tREGACQ: register access allowed 0.6 ms after reset
+    reset();        // hardware RESET/PWDN pulse if registered, else SW command
+    delayMs(5U);    // register/reference settle after reset (th(RSTCM) >= 8 tCLK)
 
     // Verify device ID – upper 3 bits must be 0b001 (= 1) for ADS1263
     const uint8_t id = readReg(ADS1263Reg::ID);
@@ -173,8 +198,24 @@ bool ADS1263::begin(ADS1263Rate rate, ADS1263Gain gain)
         return false;
     }
 
-    // MODE1: sinc4 filter (reset default 0x00)
+    // MODE1: Sinc1 filter (FILTER=000) — zero-latency, single-cycle settled.
+    // Important for channel scanning: after an INPMUX change restarts the
+    // conversion, the very next DRDY already carries fully-settled data.
     if (!writeReg(ADS1263Reg::MODE1, 0x00U))
+    {
+        return false;
+    }
+
+    // POWER: enable internal 2.5 V reference (INTREF=1), VBIAS off.
+    // Reset default (0x11) already has INTREF=1; written explicitly here.
+    if (!writeReg(ADS1263Reg::POWER, 0x01U))
+    {
+        return false;
+    }
+
+    // REFMUX: select the internal 2.5 V reference for ADC1
+    // (RMUXP=000 internal-P, RMUXN=000 internal-N). Reset default is 0x00.
+    if (!writeReg(ADS1263Reg::REFMUX, 0x00U))
     {
         return false;
     }
@@ -253,19 +294,23 @@ void ADS1263::setDRDYFlag(volatile bool* flag)
 
 bool ADS1263::read(int32_t& raw, uint32_t timeout_ms)
 {
-    // RDATA1 frame: [cmd][dummy x4]  →  response: [STATUS][D3][D2][D1][D0]
-    const uint8_t tx[5] = {
+    // RDATA1 *by command* with STATUS byte enabled (IFACE.STATUS=1, CRC off).
+    // Per datasheet Fig 9-44, the command byte clocks out a don't-care byte
+    // first, THEN the STATUS byte, THEN 4 data bytes — 6 bytes total:
+    //   send:  [RDATA1][dummy][dummy][dummy][dummy][dummy]
+    //   recv:  [dontcr][STATUS][ D3  ][ D2  ][ D1  ][ D0  ]
+    const uint8_t tx[6] = {
         static_cast<uint8_t>(ADS1263Cmd::RDATA1),
-        0x00U, 0x00U, 0x00U, 0x00U
+        0x00U, 0x00U, 0x00U, 0x00U, 0x00U
     };
-    uint8_t rx[5] = {};
+    uint8_t rx[6] = {};
 
     auto assemble = [&]() -> int32_t {
         const uint32_t u =
-            (static_cast<uint32_t>(rx[1]) << 24U) |
-            (static_cast<uint32_t>(rx[2]) << 16U) |
-            (static_cast<uint32_t>(rx[3]) <<  8U) |
-             static_cast<uint32_t>(rx[4]);
+            (static_cast<uint32_t>(rx[2]) << 24U) |   // D3 (MSB)
+            (static_cast<uint32_t>(rx[3]) << 16U) |   // D2
+            (static_cast<uint32_t>(rx[4]) <<  8U) |   // D1
+             static_cast<uint32_t>(rx[5]);            // D0 (LSB)
         return static_cast<int32_t>(u);
     };
 
@@ -284,26 +329,28 @@ bool ADS1263::read(int32_t& raw, uint32_t timeout_ms)
         if (elapsed > timeout_ms) { return false; }
 
         csLow();
-        const bool ok = spiTransfer(tx, rx, 5U);
+        const bool ok = spiTransfer(tx, rx, 6U);
         csHigh();
         if (!ok) { return false; }
 
+        m_last_status = rx[1];
         raw = assemble();
         return true;
     }
 
-    // ── Polling path: loop RDATA1 until STATUS.ADC1 is set ──────────────────
-    // With IFACE.STATUS=1, bit 6 of rx[0] indicates new data since last read.
+    // ── Polling path: loop RDATA1 until STATUS.ADC1 (bit 6) is set ──────────
+    // The STATUS byte is rx[1]; bit 6 = new ADC1 data since the last read.
     uint32_t elapsed_ms = 0U;
     while (elapsed_ms <= timeout_ms)
     {
         csLow();
-        const bool ok = spiTransfer(tx, rx, 5U);
+        const bool ok = spiTransfer(tx, rx, 6U);
         csHigh();
 
         if (!ok) { return false; }
 
-        if ((rx[0] & STATUS_ADC1_RDY) != 0U)
+        m_last_status = rx[1];
+        if ((rx[1] & STATUS_ADC1_RDY) != 0U)
         {
             raw = assemble();
             return true;
