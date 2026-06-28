@@ -56,10 +56,10 @@ set(CMAKE_ASM_FLAGS_INIT
 # ─── Executable linker flags ─────────────────────────────────────────────────
 # -nostartfiles  : BSP supplies its own startup (reset_program.S / resetprg.c)
 # --gc-sections  : remove dead code/data (requires -ffunction/data-sections above)
-# -u _printf_float : pull float formatting into newlib vsnprintf (for log_printf)
-# -lc -lgcc      : newlib C library + GCC compiler-support routines
+# -u __printf_float : pull float formatting into newlib-nano vsnprintf (for log_printf %f)
+# -lc -lgcc      : newlib-nano C library + GCC compiler-support routines
 #
 # The linker script path and -L search path are set per-target in CMakeLists.txt
 set(CMAKE_EXE_LINKER_FLAGS_INIT
-    "-nostartfiles -Wl,--gc-sections -u _printf_float"
+    "-nostartfiles -Wl,--gc-sections -u __printf_float"
     CACHE STRING "" FORCE)

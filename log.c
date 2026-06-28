@@ -23,10 +23,13 @@
 #define LOG_BUF_SIZE 80U    /* fits in one full TX byteq write */
 
 static sci_hdl_t s_log_hdl = NULL;
+static volatile bool s_log_done = true;
+
 
 static void log_sci7_callback(void *p_args)
 {
-    (void)p_args;
+    sci_cb_args_t *a = p_args;
+    if (a->event == SCI_EVT_TEI) s_log_done = true;
 }
 
 void log_init(void)
@@ -73,6 +76,7 @@ void log_puts(const char *s)
     if (s_log_hdl == NULL || s == NULL)
         return;
 
+
     uint16_t len = (uint16_t)strlen(s);
     if (len == 0U)
         return;
@@ -82,7 +86,31 @@ void log_puts(const char *s)
     if (len > LOG_BUF_SIZE)
         len = (uint16_t)LOG_BUF_SIZE;
 
-    R_SCI_Send(s_log_hdl, (uint8_t *)s, len);
+    s_log_done = false;
+    sci_err_t send_err = R_SCI_Send(s_log_hdl, (uint8_t *)s, len);
+    if (send_err != SCI_SUCCESS)
+    {
+        if (send_err == SCI_ERR_XCVR_BUSY)
+        {
+            /* TX not idle yet — previous TEI may not have fired.
+             * Skip this message rather than blocking forever. */
+        }
+        return;
+    }
+
+    /* Spin until TEI with a timeout: ~20 ms at 240 MHz.
+     * If we ever hit this timeout, the TXI→TEI chain broke. */
+    volatile uint32_t timeout = 4800000U;
+    while (!s_log_done && timeout > 0U)
+    {
+        --timeout;
+    }
+    if (0U == timeout)
+    {
+        /* TEI never fired — queue may be corrupted.  Flush and reset. */
+        s_log_done = true;  /* unblock next caller */
+    }
+
 }
 
 void log_printf(const char *fmt, ...)

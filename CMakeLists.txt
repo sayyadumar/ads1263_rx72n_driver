@@ -125,7 +125,7 @@ target_link_options(ads1263_app PRIVATE
     -Wl,-Map=${PROJECT_BINARY_DIR}/ads1263_app.map,--cref
 
     # C library and compiler-support (after all object files)
-    -lc
+    --specs=nano.specs -Wl,-u,__printf_float -lc
     -lgcc
 )
 

@@ -8,11 +8,11 @@
 //  P27        │ SCLK        │ SCK1    (SCI1 clock)       [FIT-managed]
 //  P30        │ DOUT        │ SMISO1  (SCI1 MISO)        [FIT-managed]
 //  P31        │ /CS         │ GPIO output, active-low    [manual]
-//  P04        │ /DRDY       │ IRQ12 input, active-low    [direct ICU]
+//  P44        │ /DRDY       │ IRQ12 input, active-low    [direct ICU]
 // ──────────────────────────────────────────────────────────────────
 //
-// IRQ12 is on P04 for the 176-pin LFBGA package (check your hardware
-//   manual if you have a different package).  The ISEL bit in P04PFS
+// IRQ12 is on P44 for the 176-pin LFBGA package (check your hardware
+//   manual if you have a different package).  The ISEL bit in P44PFS
 //   enables the ICU IRQ12 input; no PSEL is needed.
 //
 // SPI parameters
@@ -39,12 +39,14 @@ extern "C" void ads1263_sci_callback(void* p_args);
 //   R_BSP_PRAGMA_STATIC_INTERRUPT → static void f(void) __attribute__((interrupt(...), used));
 //   R_BSP_ATTRIB_STATIC_INTERRUPT → static
 // Both are equivalent to the non-STATIC forms for GNURX vector placement.
-
-R_BSP_PRAGMA_STATIC_INTERRUPT(irq12_isr, VECT(ICU, IRQ12))
-
 static volatile bool s_drdy = false;   // set by ISR, cleared by read()
 
-R_BSP_ATTRIB_STATIC_INTERRUPT void irq12_isr(void)
+extern "C"
+{
+R_BSP_PRAGMA_STATIC_INTERRUPT(irq12_isr, VECT(ICU, IRQ12))
+}
+
+__attribute__((used)) R_BSP_ATTRIB_STATIC_INTERRUPT void irq12_isr(void)
 {
     s_drdy = true;
 }
@@ -150,17 +152,22 @@ int main(void)
     log_init();
     log_puts("\r\n=== ADS1263 RX72M driver starting ===\r\n");
 
+
     setup_cs_pin();
     log_puts("CS pin P31 ready\r\n");
+
 
     setup_reset_pin();         // P72 high → bring ADS1263 out of reset/power-down
     log_puts("RESET pin P72 deasserted (high)\r\n");
 
+
     irq12_init();
-    log_puts("IRQ12 /DRDY configured (P04, falling edge, priority 3)\r\n");
+    log_puts("IRQ12 /DRDY configured (P44, falling edge, priority 3)\r\n");
+
 
     sci_hdl_t sci_hdl = open_sci1_spi();
     log_puts("SCI1 SPI Mode-1 @ 1 MHz ready\r\n");
+
 
     // PORT3.PODR.BYTE = output data register for Port 3; 0x02 = bit 1 (P31)
     ADS1263 adc(sci_hdl, PORT3.PODR.BYTE, 0x02U);
@@ -176,11 +183,12 @@ int main(void)
     //   0xFF  → MISO stuck high / floating (DOUT not driven / not connected)
     //   other → SPI mode or bit-order mismatch
     const uint8_t raw_id = adc.readReg(ADS1263Reg::ID);
-    log_printf("ADS1263 ID register = 0x%02X (expect 0x2x)\r\n", (unsigned)raw_id);
+    log_printf("ADS1263 ID register = 0x%x (expect 0x2x)\r\n", (unsigned)raw_id);
+
 
     if (!adc.begin(ADS1263Rate::SPS_100, ADS1263Gain::GAIN_1))
     {
-        log_printf("ADS1263 init FAILED (ID=0x%02X) — see checklist below\r\n",
+        log_printf("ADS1263 init FAILED (ID=%d) — see checklist below\r\n",
                    (unsigned)raw_id);
         log_puts("  - RESET/PWDN (pin 20) wired to P72 and driven high\r\n");
         log_puts("  - XTAL1/CLKIN tied to DGND (internal osc), XTAL2 floating\r\n");
@@ -190,14 +198,12 @@ int main(void)
     }
     log_puts("ADS1263 ID OK, configured 100 SPS / Gain 1\r\n");
 
-    // Use STATUS-byte polling for conversion-ready (does NOT depend on the
-    // /DRDY pin/IRQ being wired).  read() issues RDATA1 and checks the STATUS
-    // byte's ADC1 "new data" bit over SPI.
-    //
-    // If you have /DRDY (ADS1263 pin 14) physically wired to P44, you can switch
-    // to the lower-latency IRQ path instead:  adc.setDRDYFlag(&s_drdy);
-    adc.setDRDYFlag(nullptr);
-    (void)s_drdy;   // IRQ flag unused in polling mode
+
+    // Conversion-ready detected via /DRDY pin (P44) wired to IRQ12.
+    // The ISR sets s_drdy=true on each falling edge; read() waits on this
+    // flag instead of polling the STATUS byte over SPI — lower latency and
+    // less SPI bus traffic.
+    adc.setDRDYFlag(&s_drdy);   // IRQ12 /DRDY path — lower latency, less SPI traffic
 
     adc.start();
     log_puts("Continuous conversions started\r\n");
@@ -206,20 +212,22 @@ int main(void)
     // If these read back as expected, SPI + config are good and conversions
     // should flag ready.  If they read 0x00 or 0xFF, SPI is not actually
     // exchanging data (wiring / SPI mode), regardless of the earlier ID match.
-    //   Expect: IFACE=0x04, MODE0=0x00, MODE1=0x00, MODE2=0x07 (100SPS/gain1),
+    //   Expect: IFACE=0x04, MODE0=0x00, MODE1=0x00, MODE2=0x87 (BYPASS=1 + SPS_100 with gain=1),
     //           POWER=0x01, REFMUX=0x00, ID=0x2x
-    log_printf("REG  IFACE=0x%02X MODE0=0x%02X MODE1=0x%02X MODE2=0x%02X\r\n",
+
+    log_printf("REG  IFACE=%d MODE0=%d MODE1=%d MODE2=%d\r\n",
                (unsigned)adc.readReg(ADS1263Reg::IFACE),
                (unsigned)adc.readReg(ADS1263Reg::MODE0),
                (unsigned)adc.readReg(ADS1263Reg::MODE1),
                (unsigned)adc.readReg(ADS1263Reg::MODE2));
-    log_printf("REG  POWER=0x%02X REFMUX=0x%02X INPMUX=0x%02X ID=0x%02X\r\n",
+
+    log_printf("REG  POWER=%d REFMUX=%d INPMUX=%d ID=%d\r\n",
                (unsigned)adc.readReg(ADS1263Reg::POWER),
                (unsigned)adc.readReg(ADS1263Reg::REFMUX),
                (unsigned)adc.readReg(ADS1263Reg::INPMUX),
                (unsigned)adc.readReg(ADS1263Reg::ID));
 
-    log_puts("Scanning AIN0..AIN9 single-ended vs AINCOM, VREF=2.5V int\r\n");
+    //log_puts("Scanning AIN0..AIN9 single-ended vs AINCOM, VREF=2.5V int\r\n");
 
     // Channels to scan: AIN0..AIN9, each measured single-ended against AINCOM.
     // (AINCOM is the shared negative input — pin 3.)  Sinc1 filter means the
@@ -238,7 +246,8 @@ int main(void)
     while (true)
     {
         ++sweep;
-        log_printf("--- sweep %u ---\r\n", (unsigned)sweep);
+
+        log_printf("--- sweep %d ---\r\n", (unsigned)sweep);
 
         for (uint8_t ch = 0U; ch < k_num_channels; ++ch)
         {
@@ -247,6 +256,7 @@ int main(void)
             if (!adc.setMux(k_channels[ch], ADS1263Mux::AINCOM))
             {
                 ++err_count;
+
                 log_printf("AIN%u: setMux FAILED\r\n", (unsigned)ch);
                 continue;
             }
@@ -256,6 +266,7 @@ int main(void)
             {
                 const float voltage =
                     ADS1263::toVolts(raw, 2.5f, ADS1263Gain::GAIN_1);
+
                 log_printf("  AIN%u: raw=%d  v=%+.6f V\r\n",
                            (unsigned)ch, (int)raw, (double)voltage);
             }
@@ -267,7 +278,8 @@ int main(void)
                 //          or STATUS not enabled); bit6 never set
                 //   0x40 → would have been "ready" (shouldn't reach here)
                 //   0xFF → MISO stuck high
-                log_printf("  AIN%u: read timeout (STATUS=0x%02X err=%u)\r\n",
+
+                log_printf("  AIN%u: read timeout (STATUS=%d err=%u)\r\n",
                            (unsigned)ch, (unsigned)adc.lastStatus(),
                            (unsigned)err_count);
             }
